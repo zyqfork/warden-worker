@@ -18,7 +18,9 @@
  */
 
 import RustWorker from "../build/index.js";
-import { base64UrlDecode, handleAzureUpload, handleDownload } from "./attachments.js";
+import { decodeJwtPayloadUnsafe } from "./jwt.js";
+import { jsonError } from "./streaming-common.js";
+import { handleAzureUpload, handleDownload } from "./attachments.js";
 import { handleSendUpload, handleSendDownload } from "./sends.js";
 
 function getBearerToken(request) {
@@ -26,20 +28,6 @@ function getBearerToken(request) {
   if (!auth) return null;
   const m = auth.match(/^\s*Bearer\s+(.+?)\s*$/i);
   return m ? m[1] : null;
-}
-
-// Decode JWT payload WITHOUT verifying signature (used only for sharding DO instances).
-// The Durable Object handler will perform full verification and reject invalid tokens.
-function decodeJwtPayloadUnsafe(token) {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const payloadB64 = parts[1];
-    const payloadJson = new TextDecoder().decode(base64UrlDecode(payloadB64));
-    return JSON.parse(payloadJson);
-  } catch {
-    return null;
-  }
 }
 
 function normalizeUsername(username) {
@@ -118,68 +106,87 @@ function shouldOffloadToHeavyDo(request, url) {
   return methods.has(method);
 }
 
-// Parse azure-upload route: /api/ciphers/{id}/attachment/{attachment_id}/azure-upload
-function parseAzureUploadPath(path) {
+function parsePathParams(path, pattern) {
   const parts = path.replace(/^\//, "").split("/");
-  // Expected: ["api", "ciphers", "{cipher_id}", "attachment", "{attachment_id}", "azure-upload"]
-  if (
-    parts.length === 6 &&
-    parts[0] === "api" &&
-    parts[1] === "ciphers" &&
-    parts[3] === "attachment" &&
-    parts[5] === "azure-upload"
-  ) {
-    return { cipherId: parts[2], attachmentId: parts[4] };
+  if (parts.length !== pattern.length) {
+    return null;
   }
-  return null;
+
+  const params = {};
+  for (let i = 0; i < pattern.length; i++) {
+    const expected = pattern[i];
+    const actual = parts[i];
+
+    if (typeof expected === "string") {
+      if (actual !== expected) {
+        return null;
+      }
+      continue;
+    }
+
+    if (expected.exclude?.includes(actual)) {
+      return null;
+    }
+    params[expected.name] = actual;
+  }
+
+  return params;
 }
 
-// Parse download route: /api/ciphers/{id}/attachment/{attachment_id}/download
-function parseDownloadPath(path) {
-  const parts = path.replace(/^\//, "").split("/");
-  // Expected: ["api", "ciphers", "{cipher_id}", "attachment", "{attachment_id}", "download"]
-  if (
-    parts.length === 6 &&
-    parts[0] === "api" &&
-    parts[1] === "ciphers" &&
-    parts[3] === "attachment" &&
-    parts[5] === "download"
-  ) {
-    return { cipherId: parts[2], attachmentId: parts[4] };
-  }
-  return null;
-}
+const FAST_PATH_ROUTES = [
+  {
+    method: "PUT",
+    pattern: ["api", "ciphers", { name: "cipherId" }, "attachment", { name: "attachmentId" }, "azure-upload"],
+    tokenParam: "token",
+    missingTokenMessage: "Missing upload token",
+    handler: (request, env, params, token) =>
+      handleAzureUpload(request, env, params.cipherId, params.attachmentId, token),
+  },
+  {
+    method: "PUT",
+    pattern: ["api", "sends", { name: "sendId" }, "file", { name: "fileId" }, "azure-upload"],
+    tokenParam: "token",
+    missingTokenMessage: "Missing upload token",
+    handler: (request, env, params, token) =>
+      handleSendUpload(request, env, params.sendId, params.fileId, token),
+  },
+  {
+    method: "GET",
+    pattern: ["api", "ciphers", { name: "cipherId" }, "attachment", { name: "attachmentId" }, "download"],
+    tokenParam: "token",
+    missingTokenMessage: "Missing download token",
+    handler: (request, env, params, token) =>
+      handleDownload(request, env, params.cipherId, params.attachmentId, token),
+  },
+  {
+    method: "GET",
+    pattern: ["api", "sends", { name: "sendId", exclude: ["access", "file"] }, { name: "fileId" }],
+    tokenParam: "t",
+    missingTokenMessage: "Missing download token",
+    handler: (request, env, params, token) =>
+      handleSendDownload(request, env, params.sendId, params.fileId, token),
+  },
+];
 
-// Parse send azure-upload route: /api/sends/{send_id}/file/{file_id}/azure-upload
-function parseSendUploadPath(path) {
-  const parts = path.replace(/^\//, "").split("/");
-  // Expected: ["api", "sends", "{send_id}", "file", "{file_id}", "azure-upload"]
-  if (
-    parts.length === 6 &&
-    parts[0] === "api" &&
-    parts[1] === "sends" &&
-    parts[3] === "file" &&
-    parts[5] === "azure-upload"
-  ) {
-    return { sendId: parts[2], fileId: parts[4] };
-  }
-  return null;
-}
+function dispatchFastPath(request, env, url, method) {
+  for (const route of FAST_PATH_ROUTES) {
+    if (route.method !== method) {
+      continue;
+    }
 
-// Parse send download route: /api/sends/{send_id}/{file_id}
-function parseSendDownloadPath(path) {
-  const parts = path.replace(/^\//, "").split("/");
-  // Expected: ["api", "sends", "{send_id}", "{file_id}"]
-  // Must NOT match /api/sends/access/... or /api/sends/file/...
-  if (
-    parts.length === 4 &&
-    parts[0] === "api" &&
-    parts[1] === "sends" &&
-    parts[2] !== "access" &&
-    parts[2] !== "file"
-  ) {
-    return { sendId: parts[2], fileId: parts[3] };
+    const params = parsePathParams(url.pathname, route.pattern);
+    if (!params) {
+      continue;
+    }
+
+    const token = url.searchParams.get(route.tokenParam);
+    if (!token) {
+      return jsonError(route.missingTokenMessage, 401);
+    }
+
+    return route.handler(request, env, params, token);
   }
+
   return null;
 }
 
@@ -228,81 +235,10 @@ export default {
       }
     }
 
-    // Attachment upload/download fast-path (R2 zero-copy streaming + JWT validation)
-    if (method === "PUT") {
-      const parsed = parseAzureUploadPath(url.pathname);
-      if (parsed) {
-        const token = url.searchParams.get("token");
-        if (!token) {
-          return new Response(
-            JSON.stringify({ error: "Missing upload token" }), 
-            { status: 401, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        return handleAzureUpload(
-          request,
-          env,
-          parsed.cipherId,
-          parsed.attachmentId,
-          token
-        );
-      }
-
-      // Send file upload fast-path
-      const sendParsed = parseSendUploadPath(url.pathname);
-      if (sendParsed) {
-        const token = url.searchParams.get("token");
-        if (!token) {
-          return new Response(
-            JSON.stringify({ error: "Missing upload token" }),
-            { status: 401, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        return handleSendUpload(
-          request,
-          env,
-          sendParsed.sendId,
-          sendParsed.fileId,
-          token
-        );
-      }
-    } else if (method === "GET") {
-      const parsed = parseDownloadPath(url.pathname);
-      if (parsed) {
-        const token = url.searchParams.get("token");
-        if (!token) {
-          return new Response(
-            JSON.stringify({ error: "Missing download token" }),
-            { status: 401, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        return handleDownload(
-          request,
-          env,
-          parsed.cipherId,
-          parsed.attachmentId,
-          token
-        );
-      }
-
-      // Send file download fast-path
-      const sendParsed = parseSendDownloadPath(url.pathname);
-      if (sendParsed) {
-        const token = url.searchParams.get("t");
-        if (!token) {
-          return new Response(
-            JSON.stringify({ error: "Missing download token" }),
-            { status: 401, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        return handleSendDownload(
-          request,
-          env,
-          sendParsed.sendId,
-          sendParsed.fileId,
-          token
-        );
-      }
+    // Attachment/send upload and download fast-path.
+    const fastPathResponse = dispatchFastPath(request, env, url, method);
+    if (fastPathResponse) {
+      return fastPathResponse;
     }
 
     // Pass all other requests to Rust WASM

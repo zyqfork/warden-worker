@@ -28,7 +28,7 @@ use crate::{
 
 const ATTACHMENTS_BUCKET: &str = "ATTACHMENTS_BUCKET";
 const ATTACHMENTS_KV: &str = "ATTACHMENTS_KV";
-const SIZE_LEEWAY_BYTES: i64 = 1024 * 1024; // 1 MiB
+
 const DEFAULT_ATTACHMENT_TTL_SECS: i64 = 300; // 5 minutes
 const KV_MAX_VALUE_BYTES: i64 = 25 * 1024 * 1024; // 25 MiB (KV hard limit)
 
@@ -267,20 +267,20 @@ pub async fn upload_attachment_v2_data(
         read_multipart(&mut multipart).await?;
     let actual_size = file_bytes.len() as i64;
 
-    // For R2 backend: validate actual size against declared value deviation
-    // For KV backend: skip this check (we trust the actual upload size)
-    if !is_kv_backend(&env) {
-        if let Err(e) = validate_size_within_declared(&pending, actual_size) {
-            query!(
-                &db,
-                "DELETE FROM attachments_pending WHERE id = ?1",
-                pending.id
-            )
-            .map_err(|_| AppError::Database)?
-            .run()
-            .await?;
-            return Err(e);
-        }
+    // Strict match — limits were already validated at pending-record creation time
+    if actual_size != pending.file_size {
+        query!(
+            &db,
+            "DELETE FROM attachments_pending WHERE id = ?1",
+            pending.id
+        )
+        .map_err(|_| AppError::Database)?
+        .run()
+        .await?;
+        return Err(AppError::BadRequest(format!(
+            "Uploaded size ({actual_size}) does not match declared size ({})",
+            pending.file_size
+        )));
     }
 
     // Validate capacity limits (replace with actual size)
@@ -861,27 +861,7 @@ async fn read_multipart(
     Ok((file_bytes, content_type, key, file_name))
 }
 
-fn validate_size_within_declared(
-    attachment: &AttachmentDB,
-    actual_size: i64,
-) -> Result<(), AppError> {
-    let max_size = attachment
-        .file_size
-        .checked_add(SIZE_LEEWAY_BYTES)
-        .ok_or_else(|| AppError::BadRequest("Attachment size overflow".to_string()))?;
-    let min_size = attachment
-        .file_size
-        .checked_sub(SIZE_LEEWAY_BYTES)
-        .ok_or_else(|| AppError::BadRequest("Attachment size overflow".to_string()))?;
 
-    if actual_size < min_size || actual_size > max_size {
-        return Err(AppError::BadRequest(format!(
-            "Attachment size mismatch (expected within [{min_size}, {max_size}], got {actual_size})"
-        )));
-    }
-
-    Ok(())
-}
 
 fn build_upload_download_token(
     env: &Env,
